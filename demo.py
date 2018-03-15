@@ -1,233 +1,245 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from IPython.display import display
+import seaborn as sns
+from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.model_selection import train_test_split
-from sklearn.model_selection import StratifiedKFold
-import keras
-from keras.models import Sequential
-from keras.layers import Dense, Dropout, Activation
-from keras.callbacks import ModelCheckpoint
-import keras.optimizers
-from sklearn.utils import shuffle
-from sklearn.svm import SVC
-import seaborn as sb
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+import lightgbm as lgb
+from sklearn.metrics import roc_auc_score
+from tqdm import tqdm
 
 pd.set_option('display.expand_frame_repr', False)
 pd.set_option('display.max_columns', 0)
 
 train_df = pd.read_csv('data/train.csv')
-train_df = shuffle(train_df)
-test_df = pd.read_csv('data/test.csv')
-test_df = shuffle(test_df)
+res_df = pd.read_csv('data/resources_grouped.csv')
 
-print(train_df.describe())
+print(res_df.head())
+train_df = pd.merge(train_df, res_df, on='id', how='left')
+print(train_df)
+# reduce training data (total # of rows: 1'081'830)
+train_df = train_df[:100000]
 
-def create_plot(subset=train_df, x='Age', y='Fare'):
-    markers = {0: 'x', 1: 'o'}
-    colors = {'female': 'red', 'male': 'blue'}
-    labels = {(0, 'female'): 'female deceased', (1, 'female'): 'female survived',
-              (0, 'male'): 'male deceased', (1, 'male'): 'male survived'}
 
-    fig, ax = plt.subplots()
-    # ax.set_ylim([-3, 100])
-    grouped = subset.groupby(['Survived', 'Sex'])
+# 1) Exploration
 
-    for key, group in grouped:
-        group.plot(ax=ax, x=x, y=y, kind='scatter', marker=markers[key[0]], color=colors[key[1]], label=labels[key])
-
-def create_heatmap(df):
-    colormap = plt.cm.RdBu
-    plt.figure(figsize=(14,12))
-    plt.title('Pearson Correlation of Features', y=1.05, size=15)
-    sb.heatmap(df.astype(float).corr(),linewidths=0.1,vmax=1.0,
-                square=True, cmap=colormap, linecolor='white', annot=True)
-    plt.show()
-
-no_fare = train_df.query('Fare != Fare')
-print('no fare: {}'.format(len(no_fare)))
-# create_plot(babies)
-# plt.show()
-
-def show_survival_rate(subset=train_df, desc=''):
-    survived = len(subset[subset['Survived'] == 1])
+def show_approve_rate(subset=train_df, desc=''):
+    approved = len(subset[subset['project_is_approved'] == 1])
     total = len(subset)
-    print('{}: survival rate {:.1f}% ({}/{})'.format(desc, survived/total*100, survived, total))
+    print('{}: Approval rate {:.1f}% ({}/{})'.format(desc, approved / total * 100, approved, total))
 
 
-def first_char(x):
-    if not isinstance(x, str):
-        return None
-    return x[0]
+# facet = sns.FacetGrid(train_df, aspect=3, row=None, col=None, hue='project_is_approved')
+# facet.map(sns.kdeplot, 'total_price', shade=True)
+# facet.set(xlim=(0, train_df['total_price'].max()))
+# facet.add_legend()
+
+# sns.barplot(data=train_df, x='teacher_prefix', y="project_is_approved", hue=None)
+
+# show_approve_rate()
+
+# teacher_prefix, school_state, project_submitted_datetime, project_grade_category, project_subject_categories,
+# project_subject_subcategories, project_title, project_essay_1, ..., project_essay_4,
+# project_resource_summary, teacher_number_of_previously_posted_projects, project_is_approved
+# from resources.csv: description, quantity, price
+
+# print(train_df.teacher_prefix.unique())
+#
+# print(list(train_df.columns.values))
+
+cat_cols = ['teacher_prefix', 'school_state', 'project_grade_category', 'project_subject_categories',
+            'project_subject_subcategories']
+word_cols = ['project_title', 'essay_students', 'essay_project', 'project_resource_summary', 'description']
+other_drop_cols = ['id', 'teacher_id', 'project_submitted_datetime', 'project_essay_1', 'project_essay_2',
+                   'project_essay_3', 'project_essay_4', 'price']
+
+drop_cols = cat_cols + word_cols + other_drop_cols
+
+word_feature_nums = [100, 500, 500, 100, 100]
+# word_feature_nums = [10, 10, 10, 10, 10]
+
+# 2) Feature engineering
+train_df = train_df.fillna(value={'project_title': ''})
+train_df = train_df.fillna(value={'project_resource_summary': ''})
+train_df = train_df.fillna(value={'description': ''})
 
 
-def starts_with_letter(x):
-    return first_char(x).isalpha()
+def clean(s):
+    return re.sub('[^!?.,\w\s]|\x85', '', s)
 
 
-# show_survival_rate(df, 'Total')
-# for key, group in df.groupby('Sex'):
-#     show_survival_rate(group, key)
-
-def prepare_data(df):
-    df['Age'] = np.where((np.isnan(df['Age'])) &
-                         ((df['Name'].str.contains('Miss')) | (df['Name'].str.contains('Mlle')) |
-                          (df['Name'].str.contains('Ms.')) | (df['Name'].str.contains('Master'))), 8, df['Age'])
-
-    # df['Age'] = np.where((np.isnan(df['Age'])) & (df['Name'].str.contains('Master')), 8, df['Age'])
-    df['Age'] = np.where(np.isnan(df['Age']), 30, df['Age'])
-
-    # standardize age
-    # max_age = df.Age.max()
-    # df.Age = df.Age / max_age
-
-    df['male'] = np.where(df['Sex'] == 'male', 1, 0)
-
-    embarked_dummies = pd.get_dummies(df['Embarked'], prefix='Embarked', drop_first=True)
-    df = pd.concat([df, embarked_dummies], axis=1)
-
-    # standardize fare
-    df['Fare'] = np.where(np.isnan(df['Fare']), 0, df['Fare'])
-    max_fare = df.Fare.max()
-    df.Fare = df.Fare / max_fare
-
-    df = df.drop(['PassengerId', 'Name', 'Sex', 'Ticket', 'Cabin', 'Embarked', 'Pclass'], axis=1)
-    return df
+def essay_students(row):
+    if pd.isnull(row.project_essay_3):
+        return clean(str(row['project_essay_1']))
+    return clean(str(row['project_essay_1']) + ' ' + str(row['project_essay_2']))
 
 
-train_df = prepare_data(train_df)
-print(train_df.head(20))
-create_heatmap(train_df)
-# create_plot()
+def essay_project(row):
+    if pd.isnull(row.project_essay_3):
+        return clean(str(row['project_essay_2']))
+    return clean(str(row['project_essay_3']) + ' ' + str(row['project_essay_4']))
+
+
+train_df['essay_students'] = train_df.apply(essay_students, axis=1)
+train_df['essay_project'] = train_df.apply(essay_project, axis=1)
+
+train_df['description'] = train_df.description.map(clean)
+train_df['project_title_len'] = train_df['project_title'].apply(len)
+train_df['essay_students_len'] = train_df['essay_students'].apply(len)
+train_df['essay_project_len'] = train_df['essay_project'].apply(len)
+train_df['project_resource_summary_len'] = train_df['project_resource_summary'].apply(len)
+train_df['description_len'] = train_df['description'].apply(len)
+
+train_df['total_price'] = train_df['price'] * train_df['quantity']
+
+train_df = train_df.fillna(value={'teacher_prefix': 'Mrs.'})
+
+dt = pd.to_datetime(train_df['project_submitted_datetime'])
+train_df['sub_year'] = pd.DatetimeIndex(train_df['project_submitted_datetime']).year
+train_df['sub_month'] = pd.DatetimeIndex(train_df['project_submitted_datetime']).month
+train_df['sub_day'] = pd.DatetimeIndex(train_df['project_submitted_datetime']).day
+train_df['sub_dayofweek'] = pd.DatetimeIndex(train_df['project_submitted_datetime']).dayofweek
+train_df['sub_hour'] = pd.DatetimeIndex(train_df['project_submitted_datetime']).hour
+
+# ax = sns.countplot(x="teacher_number_of_previously_posted_projects", hue="project_is_approved", data=train_df)
+
+
+# for key, group in train_df.groupby('total_price'):
+#     show_approve_rate(group, key)
+
+for col in cat_cols:
+    dummies = pd.get_dummies(train_df[col], prefix=col, drop_first=False)
+    train_df = pd.concat([train_df, dummies], axis=1)
+
+print(train_df.head())
+
+# 3) Cleaning
+
+
+# for col in train_df.columns:
+#     nans = len(train_df[train_df[col].isnull()])
+#     if nans > 0:
+#         print('column {} has {} missing values'.format(col, nans))
+
+# column teacher_prefix has 11 missing values
+# column project_essay_3 has 1043673 missing values
+# column project_essay_4 has 1043673 missing values
+# column description has 192 missing values
+
+# print(train_df[train_df['teacher_prefix'].isnull()])
+
+# colormap = plt.cm.RdBu
+# plt.figure(figsize=(30, 30))
+# plt.title('Pearson Correlation of Features', y=1.05, size=25)
+# sns.heatmap(train_df.astype(float).corr(),linewidths=0.1,vmax=2.0,
+#             square=True, cmap=colormap, linecolor='white', annot=True, fmt='.2f')
+
 # plt.show()
 
-target_col = 'Survived'
-x_train = train_df.drop(target_col, axis=1).values
-y_train = train_df[target_col].values
+X = train_df.drop(['project_is_approved'], axis=1)
+y = train_df['project_is_approved']
 
+X_train, X_val, y_train, y_val = train_test_split(X, y, random_state=1)
 
-# define neural network
-def create_model(input_dim):
-    model = Sequential()
-    model.add(Dense(256, activation='relu', input_dim=input_dim))
-    model.add(Dropout(0.5))
-    model.add(Dense(256, activation='relu'))
-    model.add(Dropout(0.5))
-    model.add(Dense(1, activation='sigmoid'))
-    # model.summary()
+for i, col in tqdm(enumerate(word_cols)):
+    vectorizer = TfidfVectorizer(max_features=word_feature_nums[i], min_df=3)
+    # training_data = vectorizer.fit_transform(X_train[word_cols[i]])
+    training_data = np.array(vectorizer.fit_transform(X_train[word_cols[i]]).todense(), dtype=np.float16)
+    # val_data = vectorizer.transform(X_val[word_cols[i]])
+    val_data = np.array(vectorizer.fit_transform(X_val[word_cols[i]]).todense(), dtype=np.float16)
 
-    optimizer = keras.optimizers.Adam(lr=0.001)
-    model.compile(loss='binary_crossentropy', optimizer=optimizer, metrics=['accuracy'])
+    for j in range(word_feature_nums[i]):
+        X_train[col + '_' + str(j)] = training_data[:, j]
+        X_val[col + '_' + str(j)] = val_data[:, j]
+    # Falls man sich die Matrix anschauen will, geht das so:
+    # frequency_matrix = pd.DataFrame(data=training_data.toarray(), columns=vectorizer.get_feature_names())
 
-    return model
+print(X_train.head())
 
+params = {
+    'boosting_type': 'gbdt',
+    'objective': 'binary',
+    'metric': 'auc',
+    'max_depth': 12,
+    'num_leaves': 31,  # 127 ist nicht besser
+    'learning_rate': 0.025,
+    'feature_fraction': 0.85,
+    'bagging_fraction': 0.85,
+    'bagging_freq': 5,
+    'verbose': 0,
+    'num_threads': 1,
+    'lambda_l2': 1,
+    'min_gain_to_split': 0,
+}
 
-def train_model(model, x_train, y_train, validation_split=None, validation_data=None):
-    if validation_split or validation_data:
-        weights_file = 'output/weights_best_model.hdf5'
-        callbacks = [ModelCheckpoint(filepath=weights_file, verbose=0, save_best_only=True)]
-    else:
-        callbacks = None
+X_train = X_train.drop(drop_cols, axis=1)
+X_val = X_val.drop(drop_cols, axis=1)
 
-    hist = model.fit(x_train, y_train, batch_size=32, epochs=100, callbacks=callbacks,
-                     validation_split=validation_split, validation_data=validation_data, verbose=0)
+feature_names = list(X_train.columns)
+print('{} features: {}'.format(len(feature_names), feature_names))
 
-    return hist
-    # if validation_split:
-    #     model.load_weights(weights_file)
+model = lgb.train(
+    params,
+    lgb.Dataset(X_train, y_train, feature_name=feature_names),
+    num_boost_round=1000,
+    valid_sets=[lgb.Dataset(X_val, y_val)],
+    early_stopping_rounds=100,
+    verbose_eval=100,
+)
 
+importance = model.feature_importance()
+model_fnames = model.feature_name()
+tuples = sorted(zip(model_fnames, importance), key=lambda x: x[1])[::-1]
+tuples = [x for x in tuples if x[1] > 0]
+print('Important features:')
+print(tuples[:50])
 
-def evaluate_model(model, x_val, y_val):
-    score = model.evaluate(x_val, y_val, verbose=0)
-    return score
+p = model.predict(X_val, num_iteration=model.best_iteration)
+auc = roc_auc_score(y_val, p)
+print('AUC: {}'.format(auc))
 
+# test data
+test_df = pd.read_csv('data/test.csv')
+test_ids = test_df['id'].values
+test_df = pd.merge(test_df, res_df, on='id', how='left')
 
-def predict(model, x_test):
-    prediction = model.predict(x_test)
-    return (prediction >= 0.5).astype(int)
+test_df = test_df.fillna(value={'project_title': ''})
+test_df = test_df.fillna(value={'project_resource_summary': ''})
+test_df = test_df.fillna(value={'description': ''})
 
+test_df['essay_students'] = test_df.apply(essay_students, axis=1)
+test_df['essay_project'] = test_df.apply(essay_project, axis=1)
 
-def run_cross_validation(x, y):
-    # seed = 7
-    kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=None)
-    scores = []
+test_df['description'] = test_df.description.map(clean)
+test_df['project_title_len'] = test_df['project_title'].apply(len)
+test_df['essay_students_len'] = test_df['essay_students'].apply(len)
+test_df['essay_project_len'] = test_df['essay_project'].apply(len)
+test_df['project_resource_summary_len'] = test_df['project_resource_summary'].apply(len)
+test_df['description_len'] = test_df['description'].apply(len)
 
-    for train, val in kfold.split(x, y):
-        model = create_model(x.shape[1])
-        train_model(model, x[train], y[train], validation_data=(x[val], y[val]))
-        score = evaluate_model(model, x[val], y[val])
-        print('score: {}'.format(score[1]))
-        scores.append(score[1])
+test_df['total_price'] = test_df['price'] * test_df['quantity']
 
-    print('score avg: {}, score stdv: {}'.format(np.mean(scores), np.std(scores)))
+test_df = test_df.fillna(value={'teacher_prefix': 'Mrs.'})
 
+dt = pd.to_datetime(test_df['project_submitted_datetime'])
+test_df['sub_year'] = pd.DatetimeIndex(test_df['project_submitted_datetime']).year
+test_df['sub_month'] = pd.DatetimeIndex(test_df['project_submitted_datetime']).month
+test_df['sub_day'] = pd.DatetimeIndex(test_df['project_submitted_datetime']).day
+test_df['sub_dayofweek'] = pd.DatetimeIndex(test_df['project_submitted_datetime']).dayofweek
+test_df['sub_hour'] = pd.DatetimeIndex(test_df['project_submitted_datetime']).hour
 
-def create_result(x_train, y_train, df):
-    final_model = create_model(x_train.shape[1])
-    train_model(final_model, x_train, y_train, validation_split=0.2)
-    final_model.load_weights('output/weights_best_model.hdf5')
+for col in cat_cols:
+    dummies = pd.get_dummies(test_df[col], prefix=col, drop_first=False)
+    test_df = pd.concat([test_df, dummies], axis=1)
 
-    test_passenger_ids = df.PassengerId.values
-    test_passenger_ids.shape = (test_passenger_ids.shape[0], 1)
-    df = prepare_data(df)
-    # if 'Cabin_T' not in test_df:
-    #     test_df['Cabin_T'] = 0
-    x_test = df.values
+X_test = test_df.drop(drop_cols, axis=1)
+preds = model.predict(X_test, num_iteration=model.best_iteration)
 
-    prediction = predict(final_model, x_test)
-    result = np.concatenate((test_passenger_ids, prediction), axis=1)
-    np.savetxt("output/result.csv", result, delimiter=",", fmt='%1i', header='PassengerId,Survived', comments='')
-    return final_model
-
-
-def visualize_model(model, history):
-    plt.figure(1)
-    h = history.history
-    print('acc: {}, val acc: {}, loss: {}, val loss: {}'.format(h['acc'][-1], h['val_acc'][-1], h['loss'][-1], h['val_loss'][-1]))
-    # summarize history for accuracy
-    plt.subplot(221)
-    plt.plot(history.history['acc'])
-    plt.plot(history.history['val_acc'])
-    plt.title('Accuracy')
-    plt.ylabel('Accuracy')
-    plt.xlabel('Epoch')
-    plt.legend(['train', 'val'], loc='upper left')
-    # plt.show()
-    # summarize history for loss
-    plt.subplot(222)
-    plt.plot(history.history['loss'])
-    plt.plot(history.history['val_loss'])
-    plt.title('Loss')
-    plt.ylabel('Loss')
-    plt.xlabel('Epoch')
-    plt.legend(['train', 'val'], loc='upper right')
-    plt.show()
-
-
-# clf = SVC(probability=True)
-# clf.fit(x_train, y_train)
-#
-# test_df_prepared = prepare_data(test_df)
-# x_test = test_df_prepared.values
-#
-# prediction = clf.predict(x_test)
-# print(prediction)
-#
-# test_passenger_ids = test_df.PassengerId.values
-# test_passenger_ids.shape = (test_passenger_ids.shape[0], 1)
-# prediction.shape = (prediction.shape[0], 1)
-# result = np.concatenate((test_passenger_ids, prediction), axis=1)
-# np.savetxt("output/result.csv", result, delimiter=",", fmt='%1i', header='PassengerId,Survived', comments='')
-
-
-
-# run_cross_validation(x_train, y_train)
-
-# model = create_result(x_train, y_train, test_df)
-#
-# model = create_model(x_train.shape[1])
-# hist = train_model(model, x_train, y_train, validation_split=0.2)
-# visualize_model(model, hist)
-
-
-
+subm = pd.DataFrame()
+subm['id'] = test_ids
+subm['project_is_approved'] = preds
+subm.to_csv('submission.csv', index=False)

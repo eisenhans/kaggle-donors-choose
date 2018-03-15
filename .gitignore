@@ -2,4 +2,7 @@
 data
 output
 scratch.py
+oleg_panichev.py
+*.csv
+.ipynb_checkpoints
 
